@@ -25,9 +25,16 @@ class Document:
             "metadata": self.metadata
         }
         return json.dumps(data)
-    
 
-def get_pdf_content(file):
+def get_pdf_content(files):
+    text = ""
+    for docs in files:
+        pdf_reader = PdfReader(docs)  # it initialises pdf object which take pages
+        for page in pdf_reader.pages:
+            text += page.extract_text()
+    return text    
+
+def get_pdf_content2(file):
     #pattern = r'^(\d+\.\d* (?:\b\w+\b\s*){1,5}\w*)'
     #pattern = r'^\d+(\.\d+)?\s+[A-Z][a-zA-Z\s.]+$'
     #pattern = r"^\d+(?:\.\d+)* .*(?:\r?\n(?!\d+(?:\.\d+)* ).*)*"
@@ -82,8 +89,9 @@ def get_text_chunks(pages):
         chunk_overlap=300,
         length_function=len
     )
-    chunks = text_splitter.split_documents(pages)
+    chunks = text_splitter.split_text(pages)
     return chunks 
+
 
 def get_vectorstore(text_chunks):
     #embeddings = HuggingFaceInstructEmbeddings(model_name = "hkunlp/instructor-xl")
@@ -93,6 +101,7 @@ def get_vectorstore(text_chunks):
     #vectorstore = Chroma.from_documents(documents=text_chunks,embedding=embeddings,persist_directory=persist_directory)
     vectorstore = FAISS.from_documents(documents=text_chunks, embedding=embeddings)
     return vectorstore
+
 
 def get_conversational_chain(vectorStore,input_llm):
 
@@ -189,6 +198,17 @@ def main():
 
                 # split the text chunks 
                 text_chunks = get_text_chunks(pages)
+                pattern = r"^\d+(?:\.\d+)* .*$"
+
+                for chunk in text_chunks:
+                    matches = re.findall(pattern, chunk, re.MULTILINE)
+                    if(len(matches)!=0):
+                         titles = matches
+                         st.write(chunk)
+                         st.write(titles)
+                
+                
+                
                 st.write(text_chunks)
 
                 # create vector store 
@@ -212,7 +232,7 @@ def main():
                 st.write(prompt_template.messages[0].prompt.input_variables)
 
                 #converstational chain
-                st.session_state.conversation = get_conversational_chain(vectorStore,llm)
+                #st.session_state.conversation = get_conversational_chain(vectorStore,llm)
 
 
 
