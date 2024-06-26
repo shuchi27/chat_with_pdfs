@@ -1,3 +1,7 @@
-langchain==0.0.161
-PyPDF2==3.0.1
-streamlit==1.22.0
+langchain
+PyPDF2
+streamlit
+openai
+langchain-community
+langchain-core
+langchain_openai
