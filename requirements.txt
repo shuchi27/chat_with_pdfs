@@ -5,6 +5,7 @@ langchain
 PyPDF2
 streamlit
 openai
+faiss-cpu
 langchain-community
 langchain-core
 langchain_openai
