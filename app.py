@@ -11,6 +11,7 @@ from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain,RetrievalQA
 from htmlTemplates import  css, bot_template, user_template
 from langchain_core.prompts import ChatPromptTemplate,PromptTemplate
+from langchain.chains.summarize import load_summarize_chain
 import os
 import re
 import json
@@ -31,7 +32,6 @@ def load_vectorstore(text_chunks=None):
             db.save_local("db")
     else:
         if text_chunks is not None:
-            st.write("chubk isnot noe........")
             # Create a new vectorstore from the text chunks
             db = FAISS.from_documents(documents=text_chunks, embedding=OpenAIEmbeddings())
             # Save the new vectorstore to disk
@@ -100,6 +100,7 @@ def get_pdf_content(file):
 
             # Serialize the dictionary to a JSON string
             document = Document(json.dumps(pdf_data))
+            st.write(str(document))
             page_count = page_count+1
             documents.append(document)
     return documents    
@@ -143,7 +144,7 @@ def model_query(user_question,num_sources,faiss_indices,selected_file):
      # Load from local storage
     #persisted_vectorstore = load_vectorstore()
     new_db = faiss_indices[selected_file]
-    docs = new_db.similarity_search_with_relevance_scores(user_question, k=num_sources)
+    docs = new_db.similarity_search_with_relevance_scores(user_question)
     for doc in docs:
         st.write(doc)
         logging.info("-------------")
@@ -192,7 +193,6 @@ def model_query(user_question,num_sources,faiss_indices,selected_file):
     )
 
     ai_message = qa.run(user_question)
-
 
     return ai_message,docs
    
@@ -254,8 +254,6 @@ def get_indices_for_file(db, file_name):
     return faiss_indices
 
 
-
-
 def main():
     load_dotenv()
 
@@ -286,6 +284,7 @@ def main():
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
+    
 
     st.set_page_config(st.session_state.title,page_icon=":books:")
     st.write(css, unsafe_allow_html=True)
@@ -293,54 +292,63 @@ def main():
     faiss_indices  = None
     with st.sidebar:
         st.title("Document Query Settings")
-
+        
         st.subheader("Your Documents")
         
         uploaded_file_names = ""
-        files = st.file_uploader("Upload your PDFs here and click on process",accept_multiple_files=True)
-
+        files = st.file_uploader("Upload your PDFs here and click on process", accept_multiple_files=True)
+        text_chunks = ""
         if st.button("Load Data"):
             if files:
-                st.session_state.uploaded_file=True
+                st.session_state.uploaded_file = True
                 for f in files:
                     uploaded_file_names = f.name
 
             if doc_list is not None:
-                isFile = isFilesExist(uploaded_file_names,doc_list)
-            
+                isFile = isFilesExist(uploaded_file_names, doc_list)
+
             if isFile:
                 for f in files:
                     # get content from uploaded PDFs
                     pages = get_pdf_content(files)
-                    
-                    
-                    # split the text chunks 
-                    text_chunks = get_text_chunks(pages)
-                    
 
-                    #st.write("creatig vectorstore.....")
-                    vectorStore = load_vectorstore(text_chunks) 
-                    #st.write(vectorStore)
-        #selected_files = st.multiselect("Please select the files to query:", options=doc_list)
-        selected_file = st.selectbox(
-                    "Please select the files to query:",
-                    options=doc_list,
-                    index=0  # Default to gpt-4o
-                )
-        
+                    # split the text chunks
+                    text_chunks = get_text_chunks(pages)
+
+                    st.write(len(text_chunks))
+
+                    # st.write("creatig vectorstore.....")
+                    vectorStore = load_vectorstore(text_chunks)
+                    # st.write(vectorStore)
+
+        # Add select box for choosing between Selected File or Entire Database
+        select_option = st.selectbox(
+            "Select option:",
+            options=["Selected File", "Entire Database"],
+            index=0  # Default to Selected File
+        )
+
+        if select_option == "Selected File":
+            selected_file = st.selectbox(
+                "Please select the file to query:",
+                options=doc_list,
+                index=0  # Default to the first file in doc_list
+            )
+        elif select_option == "Entire Database":
+            st.write("You selected to query the entire database.")
+
         # Add a slider for number of sources to return 1-5
         num_sources = st.slider("Number of sources per document:", min_value=1, max_value=5, value=3)
 
-        #temp_value = st.text_input("Mention a Temperature range(0 to 1)(Default:0)")
-        
         model_version = st.selectbox(
             "Select the GPT model version:",
-            options=["gpt-4o","gpt-4-1106-preview","gpt-3.5-turbo-1106"],
+            options=["gpt-4o", "gpt-4-1106-preview", "gpt-3.5-turbo-1106"],
             index=0  # Default to gpt-4o
         )
 
         st.session_state.model = model_version
-        llm = ChatOpenAI(temperature =0,model = st.session_state.model)
+        llm = ChatOpenAI(temperature=0, model=st.session_state.model)
+
         if selected_file:
          vectorStore = load_vectorstore() 
          faiss_indices = get_indices_for_file(vectorStore,selected_file)
@@ -375,6 +383,9 @@ def main():
                 if faiss_indices is not None:
 
                     docs = faiss_indices[selected_file].similarity_search_with_relevance_scores(question,k=10)
+                      
+                    #st.write(docs)  
+                    st.write(len(docs))
 
                     prompt_template = ChatPromptTemplate.from_template(template_string)
 
@@ -382,7 +393,15 @@ def main():
                     text=docs
                     )
 
-                    summary_response = llm(customer_messages)
+                    #Method 1 : Normal method to generate summary
+                    #summary_response = llm(customer_messages)
+
+                    #Method 2: load_summarize_chain general
+                    chain = load_summarize_chain(llm, chain_type="stuff")
+                    first_documents = [docs[0][0]]
+                    summary_response =  chain.run(first_documents)
+
+
                     st.session_state.summary = summary_response
                     #st.write(summary_response.content)
 
@@ -419,7 +438,7 @@ def main():
             with st.container():
                 st.markdown('<div class="chat-box">', unsafe_allow_html=True)
                 if (st.session_state.is_summary):
-                    st.write(st.session_state.summary.content)
+                    st.write(st.session_state.summary)
                 else:
                     if user_question:
                         for message in st.session_state.chat_history:
@@ -434,7 +453,7 @@ def main():
                                         st.markdown(f"> **Context Document**: {doc.metadata['source']}")
                                         st.markdown(f"> **Page Number**: {doc.metadata['page']}")
                                         st.markdown(f"> **Content**: {doc.page_content}")
-                                        st.markdown(f"> **relevancy**: {doc[1]}")
+                                        st.markdown(f"> **Relevancy**: {relevance}")
 
             st.markdown('</div>', unsafe_allow_html=True)
 
