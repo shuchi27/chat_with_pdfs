@@ -397,6 +397,11 @@ def ivf_index_search(query: str, db_ivf, vectors,vector_ids, nlist=100, top_k=5)
     query_vector = embedding.embed_query(query)
     query_vector = np.array(query_vector).reshape(1, -1)  # Ensure the shape is correct
 
+    if(len(vectors))<nlist:
+        nlist = min(len(vectors), nlist)
+        
+
+
     dimension = query_vector.shape[1]
     # Create and train the IVF index
     quantizer = faiss.IndexFlatL2(dimension)  # Flat index for clustering
