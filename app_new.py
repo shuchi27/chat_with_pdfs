@@ -288,7 +288,7 @@ def get_indices_for_file(db, file_name):
             #filtered_embeddings.append(db.docstore._dict[key].embedding)
     
     faiss_indices = {
-                        str(file_name): FAISS.from_documents(documentList, embedding(disallowed_special=()))
+                        str(file_name): FAISS.from_documents(documentList, embedding)
                     }
     # Create a new FAISS vectorstore from the filtered embeddings
     #new_vectorstore = FAISS.from_embeddings(filtered_embeddings)
