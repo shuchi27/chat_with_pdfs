@@ -276,6 +276,8 @@ def store_to_dataframe(db):
 
 def get_indices_for_file(db, file_name):
     documentList = []
+    embedding = OpenAIEmbeddings(model="text-embedding-3-large")
+
     # Iterate through the existing vectorstore and filter embeddings for the specified file
     for key in db.docstore._dict.keys():
         doc_name = db.docstore._dict[key].metadata['source']
