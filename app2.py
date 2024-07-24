@@ -8,153 +8,173 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.vectorstores import VectorStoreRetriever
 from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain,RetrievalQA
-from htmlTemplates import  css, bot_template, user_template
-from langchain_core.prompts import ChatPromptTemplate,PromptTemplate
+from langchain.chains import ConversationalRetrievalChain, RetrievalQA
+from htmlTemplates import css, bot_template, user_template
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain.chains.summarize import load_summarize_chain
+from langchain.docstore.document import Document
+import concurrent.futures
+import openai
+import numpy as np
+import faiss
 import os
 import re
 import json
 import pandas as pd
 import logging
+import time
+import tiktoken
+import pickle
+
 logging.basicConfig(level=logging.INFO)
 
-def load_vectorstore(text_chunks=None):
-    if os.path.exists("db"):
-        # Load the existing vectorstore
-        db = FAISS.load_local("db", OpenAIEmbeddings(), allow_dangerous_deserialization=True)
-        if text_chunks is not None:
-            # Create a temporary vectorstore from the new text chunks
-            new_vectorstore = FAISS.from_documents(documents=text_chunks, embedding=OpenAIEmbeddings())
-            # Merge the new vectorstore into the existing one
-            db.merge_from(new_vectorstore)
-            # Optionally save the updated vectorstore back to disk
-            db.save_local("db")
-    else:
-        if text_chunks is not None:
-            # Create a new vectorstore from the text chunks
-            db = FAISS.from_documents(documents=text_chunks, embedding=OpenAIEmbeddings())
-            # Save the new vectorstore to disk
-            db.save_local("db")
+load_dotenv()
+
+embedding = OpenAIEmbeddings(model="text-embedding-3-large")
+
+# Create embeddings and store in FAISS index with metadata
+def create_and_store_embeddings(chunks, index_dir="db2"):
+    embeddings_list = []
+    documents = []
+
+    for chunk in chunks:
+        if isinstance(chunk, Document):
+            text_content = chunk.page_content  # Assuming 'page_content' is the attribute holding the text
+            documents.append(chunk)  # Store the document
         else:
-            # If the directory does not exist and no text_chunks provided, raise an error
-            raise ValueError("No existing vectorstore found and no text_chunks provided to create a new one.")
+            text_content = chunk  # Assuming chunk is a string if it's not a Document object
+
+        # Generate embedding for the text content and append to list
+        embeddings_list.append(embedding.embed_query(text_content))
     
-    return db
+    # Stack embeddings vertically to create a 2D array
+    embeddings = np.vstack(embeddings_list)
+    
+    dimension = embeddings.shape[1]
 
+    # Create FAISS index
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embeddings)
 
+    # Ensure the directory exists
+    os.makedirs(index_dir, exist_ok=True)
 
-class Document:
-    def __init__(self, json_string):
-        data = json.loads(json_string)
-        self.page_content = data.get("page_content", "")
-        self.metadata = data.get("metadata", {})
-    def to_json(self):
-        data = {
-            "page_content": self.page_content,
-            "metadata": self.metadata
-        }
-        return json.dumps(data)
- 
+    # Save index and documents
+    faiss.write_index(index, os.path.join(index_dir, "index.faiss"))
+    with open(os.path.join(index_dir, "index.pkl"), 'wb') as f:
+        pickle.dump(documents, f)
 
-def get_pdf_content(file):
-    #pattern = r'^(\d+\.\d* (?:\b\w+\b\s*){1,5}\w*)'
-    #pattern = r'^\d+(\.\d+)?\s+[A-Z][a-zA-Z\s.]+$'
-    #pattern = r"^\d+(?:\.\d+)* .*(?:\r?\n(?!\d+(?:\.\d+)* ).*)*"
-    #pattern =  r"^\d+(\.)*(?:\.\d+)?\s+(.*)"
-    #pattern = r"^\d+(?:\.\d+)* .*$"
+    return index
+
+# Load or create the vector store
+
+def load_vectorstore(text_chunks=None, index_dir="db2"):
+    index_path = os.path.join(index_dir, "index.faiss")
+    pkl_path = os.path.join(index_dir, "index.pkl")
+
+    if os.path.exists(index_path) and os.path.exists(pkl_path):
+        index = faiss.read_index(index_path)
+        with open(pkl_path, 'rb') as f:
+            documents = pickle.load(f)
+        if text_chunks:
+            new_index = create_and_store_embeddings(text_chunks, index_dir=index_dir)
+            index = merge_faiss_indices(index, new_index)
+            faiss.write_index(index, index_path)
+            with open(pkl_path, 'wb') as f:
+                pickle.dump(documents + text_chunks, f)
+        return index, documents
+    else:
+        if text_chunks:
+            index = create_and_store_embeddings(text_chunks, index_dir=index_dir)
+            faiss.write_index(index, index_path)
+            with open(pkl_path, 'wb') as f:
+                pickle.dump(text_chunks, f)
+            return index, text_chunks
+    return None, None
+
+# Function to create a custom FAISS index
+def create_custom_faiss_index(dimension, nlist, m, bits_per_subvector):
+    quantizer = faiss.IndexFlatL2(dimension)  # Using L2 distance for the coarse quantizer
+    index = faiss.IndexIVFPQ(quantizer, dimension, nlist, m, bits_per_subvector)
+    index.own_fields = True
+    index.make_direct_map()  # Initialize the direct map
+    return index
+
+# Merge FAISS indices
+def merge_faiss_indices(index1, index2):
+    vectors1 = [index1.reconstruct(i) for i in range(index1.ntotal)]
+    vectors2 = [index2.reconstruct(i) for i in range(index2.ntotal)]
+    combined_vectors = np.vstack((vectors1, vectors2))
+    new_index = create_custom_faiss_index(index1.d)
+    new_index.train(combined_vectors)
+    new_index.add(combined_vectors)
+    return new_index
+
+def isFilesExist(uploaded_file_name, unique_docs_list):
+    st.write("-----------------")
+
+    existing_files = [file_name for file_name in uploaded_file_name if file_name in unique_docs_list]
+    if existing_files:
+        st.write("------true-------")
+
+        st.error(f"Error: {', '.join(existing_files)} already exist in the vector store.")
+        return False
+    else:
+        st.write("------false-------")
+
+        unique_docs_list.extend(uploaded_file_name)
+        return True
+
+def get_pdf_content(files):
     pattern =  r"^\d+(?:\.\d+)?\s+(.*)"
-    #pattern =  r"^\d+(?:\.\d+)*\s+.*"
-    #pattern = r"^\d+(?:\.\d+)*\s+[A-Za-z0-9\s]+(?:[^\n])*$"
-
-    page_count = 1
-    for docs in file:
-        source = docs.name
-        pdf_reader = PdfReader(docs)  # it initialises pdf object which take pages
-        text=0
-        page_count = 0
+    chunkList = []
+    for file in files:
+        pdf_reader = PdfReader(file)
         documents = []
-        titles = ""
+        page_number=0
         for page in pdf_reader.pages:
             text = page.extract_text()  
             matches = re.findall(pattern, text, re.MULTILINE)
-
-           
-            if(len(matches)!=0):
-                titles = matches
-
-            page_content = text
-
+            titles = matches if len(matches) != 0 else []
+            page_number += 1
             metadata = {
-                'source' : source,
-                'page': page_count,
-                'heading': titles
+                'source': file.name,
+                'page': page_number,
+                'heading': titles,
             }
-           
-
             pdf_data = {
-                "page_content": page_content,
+                "page_content": text,
                 "metadata": metadata
             }
-           
-
-            # Serialize the dictionary to a JSON string
             document = Document(json.dumps(pdf_data))
-            st.write(str(document))
-            page_count = page_count+1
             documents.append(document)
-    return documents    
 
-
-def get_pdf_content_old(file):
-    text = ""
-    for docs in file:
-        pdf_reader = PdfReader(docs)  # it initialises pdf object which take pages
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text
-
+        text_chunks = get_text_chunks(documents)
+        chunkList.extend(text_chunks)
+    return chunkList
 
 def get_text_chunks(pages):
-    text_splitter = RecursiveCharacterTextSplitter(
-        separators=["(?<=\.)"," "],
-        chunk_size=1000,
-        chunk_overlap=300,
-        length_function=len
-    )
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, length_function=len)
     chunks = text_splitter.split_documents(pages)
     return chunks 
 
+# Custom search function with metadata filtering
+def search_with_metadata(query, index, metadata, top_k=5):
+    query_embedding = embedding.embed_query([query])
+    D, I = index.search(query_embedding, top_k)
 
+    alpha = 0.1
+    flat_results = [(index.docstore.search(vector_ids[idx]), np.exp(-alpha * dist)) for dist, idx in zip(D[0], I[0])]
+    return flat_results
 
-def get_conversational_chain(vectorStore,input_llm):
+def model_query(user_question, metadata, num_sources, faiss_indices, selected_file, db_index, index_type):
+    st.write("db_index:", db_index)
+    flat_results = search_with_metadata(user_question, db_index, metadata, top_k=5)
 
-    memory = ConversationBufferMemory(memory_key="chat_history",return_messages=True)
-    conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=input_llm, 
-        retriever = vectorStore.as_retriever(),
-        memory = memory
-        )
-    return conversation_chain
+    retriever = db_index.as_retriever()
 
-
-
-def model_query(user_question,num_sources,faiss_indices,selected_file):
-    # Gather related context from documents for each query
-     # Load from local storage
-    #persisted_vectorstore = load_vectorstore()
-    new_db = faiss_indices[selected_file]
-    docs = new_db.similarity_search_with_relevance_scores(user_question)
-    for doc in docs:
-        st.write(doc)
-        logging.info("-------------")
-        logging.info("Score: %s", doc[1])
-
-    retriever = new_db.as_retriever()
-
-    #rileysPrompt()
-    #prompt fot 
     template = """
+    The following is a friendly conversation between a human and an AI. The AI is talkative and provides lots of specific details from its context. If the AI does not know the answer to a question, it truthfully says it does not know. Excerpts from relevant documents the AI has read are included in the conversation and are used to answer questions more accurately. The AI is not perfect, and sometimes it says things that are inconsistent with what it has said before. The AI always replies succinctly with the answer to the question and provides more information when asked. The AI recognizes questions asked to it are usually in reference to the provided context, even if the context is sometimes hard to understand, and answers with information relevant from the context.
     Use the following context (delimited by <ctx></ctx>) and the chat history (delimited by <hs></hs>) to answer the question:
     ------
     <ctx>
@@ -168,103 +188,80 @@ def model_query(user_question,num_sources,faiss_indices,selected_file):
     {question}
     Answer:
     """
-    prompt = PromptTemplate(
-        input_variables=["context","history", "question"],
-        template=template,
-    )
-
+    prompt = PromptTemplate(input_variables=["context", "history", "question"], template=template)
 
     if 'conversation_memory' not in st.session_state:
-        st.session_state.conversation_memory = ConversationBufferMemory(
-            memory_key="history",
-            input_key="question"
-        )
+        st.session_state.conversation_memory = ConversationBufferMemory(memory_key="history", input_key="question")
 
     qa = RetrievalQA.from_chain_type(
         llm=ChatOpenAI(),
         chain_type='stuff',
         retriever=retriever,
         verbose=True,
-        chain_type_kwargs={
-            "verbose": True,
-            "prompt": prompt,
-            "memory": st.session_state.conversation_memory,
-        }
+        chain_type_kwargs={"verbose": True, "prompt": prompt, "memory": st.session_state.conversation_memory},
     )
 
     ai_message = qa.run(user_question)
 
-    return ai_message,docs
-   
+    return ai_message, flat_results
 
-def getDocNamesFromVectorStore(db):
-        unique_docs = set()
-        v_dict  = db.docstore._dict
-        for k in v_dict.keys():
-            doc_name = v_dict[k].metadata['source']
-            unique_docs.add(doc_name)
-        unique_docs_list = list(unique_docs)
-        return unique_docs_list
+def extract_vectors_from_db(db_index):
+    vectors, ids = [], []
+    for idx in range(db_index.ntotal):
+        vectors.append(db_index.reconstruct(int(idx)))
+        ids.append(idx)
+    return vectors, ids
 
-def isFilesExist(uploaded_file_name,unique_docs_list):
-        
-        if uploaded_file_name in unique_docs_list:
-            st.error(f"Error: {uploaded_file_name} already exists in the vector store.")
-            return False
-        else:
-           unique_docs_list.append(uploaded_file_name)
-           return True
-           
-               
-            
-         
-def show_vectorstore(db):
-    vector_dataframe = store_to_dataframe(db)
-    st.write(vector_dataframe)
+def getDocNamesFromIndexFile(index_dir="db2"):
+    # Define the path to the index pickle file where documents are stored
+    index_path = os.path.join(index_dir, "index.pkl")
     
-def store_to_dataframe(db):
-    v_dict  = db.docstore._dict
-    data_rows=[]
-    for key in v_dict.keys():
-        doc_name = v_dict[key].metadata['source']
-        page_number = v_dict[key].metadata['page']+1
-        content = v_dict[key].page_content
-        data_rows.append({"chunk_id":key, "document":doc_name, "page":page_number, "content":content})
-        vector_df = pd.DataFrame(data_rows)
-    return vector_df
+    # Check if the index file exists
+    if not os.path.exists(index_path):
+        print(f"No index file found in {index_dir}")
+        return []
+
+    # Load the documents from the pickle file
+    with open(index_path, 'rb') as f:
+        documents = pickle.load(f)
+
+    # Assuming documents are stored as instances of a class or dicts with metadata
+    # Extract unique document names from the metadata in these documents
+    unique_docs = set()
+    for doc in documents:
+        # Check if the document has a 'metadata' attribute or key and 'source' within that
+        if isinstance(doc, dict):
+            # Assuming the document is stored as a dictionary
+            if 'metadata' in doc and 'source' in doc['metadata']:
+                unique_docs.add(doc['metadata']['source'])
+        elif hasattr(doc, 'metadata') and 'source' in doc.metadata:
+            # Assuming the document is an instance of a class with a 'metadata' attribute
+            unique_docs.add(doc.metadata['source'])
+
+    return list(unique_docs)
 
 
 
-def get_indices_for_file(db, file_name):
-    documentList = []
-    # Iterate through the existing vectorstore and filter embeddings for the specified file
-    for key in db.docstore._dict.keys():
-        doc_name = db.docstore._dict[key].metadata['source']
-        
-        if doc_name == file_name:
-            # Append the embedding of the document to filtered_embeddings
-            documentList.append(db.docstore._dict[key])
-            #filtered_embeddings.append(db.docstore._dict[key].embedding)
-    
-    faiss_indices = {
-                        str(file_name): FAISS.from_documents(documentList, OpenAIEmbeddings(disallowed_special=()))
-                    }
-    # Create a new FAISS vectorstore from the filtered embeddings
-    #new_vectorstore = FAISS.from_embeddings(filtered_embeddings)
-    return faiss_indices
-
+# Function to convert FAISS index to a DataFrame
+def faiss_index_to_dataframe(db_index):
+    vectors, ids = extract_vectors_from_db(db_index)
+    # Convert to DataFrame
+    df = pd.DataFrame(vectors)
+    df['ID'] = ids
+    return df
 
 def main():
-    load_dotenv()
+    db_index = None
+    doc_list = []
+    if os.path.exists("db2"):
+        vector_start_time = time.time()
+        db_index,metadata = load_vectorstore(index_dir="db2")
+        df = faiss_index_to_dataframe(db_index)
+        vector_end_time = time.time()
+        vector_load_time = vector_end_time - vector_start_time
+        print(f"Time taken to load vector: {vector_load_time} seconds")
+        doc_list = getDocNamesFromVectorStore(db_index)
 
-    doc_list=[]
-    if os.path.exists("db"):
-        db = load_vectorstore()
-        doc_list = getDocNamesFromVectorStore(db)
-
-    #if db is not None:
-     #show_vectorstore(db)
-            
 
     if 'title' not in st.session_state:
         st.session_state.title = "ChatGPT with Document Query"  # Default title
@@ -284,184 +281,100 @@ def main():
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
+    if "is_vectorstore_update" not in st.session_state:
+        st.session_state.is_vectorstore_update = False
     
 
-    st.set_page_config(st.session_state.title,page_icon=":books:")
+    #st.set_page_config("ChatGPT with Document Query", page_icon=":books:")
     st.write(css, unsafe_allow_html=True)
     vectorStore = None
-    faiss_indices  = None
+    faiss_indices = None
+
     with st.sidebar:
         st.title("Document Query Settings")
-        
-        st.subheader("Your Documents")
-        
-        uploaded_file_names = ""
+        uploaded_file_names = []
         files = st.file_uploader("Upload your PDFs here and click on process", accept_multiple_files=True)
         text_chunks = ""
+
         if st.button("Load Data"):
-            if files:
-                st.session_state.uploaded_file = True
-                for f in files:
-                    uploaded_file_names = f.name
+            with st.spinner("Loading Data..."):
+                st.write("--------1--------")
 
-            if doc_list is not None:
-                isFile = isFilesExist(uploaded_file_names, doc_list)
+                if files:
+                    st.write("--------2--------")
+                    for f in files:
+                        uploaded_file_names.append(f.name)
 
-            if isFile:
-                for f in files:
-                    # get content from uploaded PDFs
-                    pages = get_pdf_content(files)
+                if doc_list:
+                    st.write("--------3--------")
+                    isFile = isFilesExist(uploaded_file_names, doc_list)
+                    st.write(isFile)
 
-                    # split the text chunks
-                    text_chunks = get_text_chunks(pages)
+                chunkList = get_pdf_content(files)
+                db_index,metadata = load_vectorstore(chunkList, index_dir="db2")
+                vectors, vector_ids = extract_vectors_from_db(db_index)
 
-                    st.write(len(text_chunks))
-
-                    # st.write("creatig vectorstore.....")
-                    vectorStore = load_vectorstore(text_chunks)
-                    # st.write(vectorStore)
-
-        # Add select box for choosing between Selected File or Entire Database
-        select_option = st.selectbox(
-            "Select option:",
-            options=["Selected File", "Entire Database"],
-            index=0  # Default to Selected File
-        )
-
-        if select_option == "Selected File":
-            selected_file = st.selectbox(
-                "Please select the file to query:",
-                options=doc_list,
-                index=0  # Default to the first file in doc_list
-            )
-        elif select_option == "Entire Database":
-            st.write("You selected to query the entire database.")
-
-        # Add a slider for number of sources to return 1-5
         num_sources = st.slider("Number of sources per document:", min_value=1, max_value=5, value=3)
-
-        model_version = st.selectbox(
-            "Select the GPT model version:",
-            options=["gpt-4o", "gpt-4-1106-preview", "gpt-3.5-turbo-1106"],
-            index=0  # Default to gpt-4o
-        )
-
+        index_type = st.selectbox("Choose faiss index to search:", options=["L2", "ivf", "ivfpq", "hsnw", "similarity_search"], index=0)
+        model_version = st.selectbox("Select the GPT model version:", options=["gpt-4o", "gpt-4-1106-preview", "gpt-3.5-turbo-1106"], index=0)
         st.session_state.model = model_version
         llm = ChatOpenAI(temperature=0, model=st.session_state.model)
+        select_option = st.selectbox("Select option to query:", options=["Entire Database", "Selected File"], index=0)
+        st.write(db_index)
+        sorted_doc_list = sorted(doc_list)
+        selected_file = None
+        
+        if select_option == "Entire Database":
+            st.write("You selected to query the entire database.")
+            with st.expander("Available Documents"):
+                if doc_list:
+                    st.write(sorted_doc_list)
 
-        if selected_file:
-         vectorStore = load_vectorstore() 
-         faiss_indices = get_indices_for_file(vectorStore,selected_file)
-                
-        if st.button("Summary"):
-            st.session_state.is_summary = True
-            with st.spinner("Processing..."):
-                st.write("........................")
-
-                if selected_file is None:
-                    st.error(f"Error: Please select the file to create summary.")
-                
-                template_string = "read the text delimited by three angular brackets.\
-                     your task is to read the demited list of text, extract most relevent information which summarize the whole document.\
-                    ,starting with 'the uploaded document is..'\
-                     and than ask user what else they want to know about that document?\
-                    <<<{text}>>>  "
-                     #Are you sure that''s your final answer?\
-                     #It might be worth taking another look\
-                    #Remember that progress is made one step at a time.\
-                     #Stay determined and keep moving forward.\
-            
-
-                #show_vectorstore(new_vectorstore)
-            
-                question = "give me summary of this uploaded document."
-                #if len(pages) >= 10:
-                    #k = 10
-                #else:
-                    #k = 5
-                #st.write(faiss_indices[selected_file])
-                if faiss_indices is not None:
-
-                    docs = faiss_indices[selected_file].similarity_search_with_relevance_scores(question,k=10)
-                      
-                    #st.write(docs)  
-                    st.write(len(docs))
-
-                    prompt_template = ChatPromptTemplate.from_template(template_string)
-
-                    customer_messages = prompt_template.format_messages(
-                    text=docs
-                    )
-
-                    #Method 1 : Normal method to generate summary
-                    #summary_response = llm(customer_messages)
-
-                    #Method 2: load_summarize_chain general
-                    chain = load_summarize_chain(llm, chain_type="stuff")
-                    first_documents = [docs[0][0]]
-                    summary_response =  chain.run(first_documents)
-
-
-                    st.session_state.summary = summary_response
-                    #st.write(summary_response.content)
-
-            
-    # Main section
-    st.title(st.session_state.title)
-
-
-    # Center container for responses
+    st.title("ChatGPT with Document Query")
     chat_container = st.container()
     with chat_container:
         response_text = st.empty()
 
-   
-   # Lower section for prompt input
-    
     user_question = st.chat_input("Ask something", key="prompt_input")
-    # Send button
-
 
     if user_question:
-        st.session_state.is_summary= False
+        st.session_state.is_summary = False
         st.session_state.chat_history.append({"role": "user", "content": user_question})
-        model_response, context = model_query(user_question,num_sources,faiss_indices,selected_file)
+        query_start_time = time.time()
+        model_response, context, final_time, embedding_time = model_query(user_question,metadata, num_sources, faiss_indices, selected_file, db_index, index_type)
+        query_end_time = time.time()
+        query_load_time = query_end_time - query_start_time
+        print(f"Time taken to search: {final_time} ms")
+        print(f"Time taken for response: {query_load_time} sec")
+        print(f"Time taken for embedding: {embedding_time:.2f} ms")
+
         st.session_state.chat_history.append({"role": "model", "content": model_response})
         if context:
             st.session_state.chat_history.append({"role": "context", "content": context})
-        #handle_userinput()
 
-
-        # Main chat container
     chat_container = st.container()
     with chat_container:
-            with st.container():
-                st.markdown('<div class="chat-box">', unsafe_allow_html=True)
-                if (st.session_state.is_summary):
-                    st.write(st.session_state.summary)
-                else:
-                    if user_question:
-                        for message in st.session_state.chat_history:
-                            if message["role"] == "user":
-                                st.markdown(f"> **User**: {message['content']}")
-                            elif message["role"] == "model":
-                                st.markdown(f"> **Model**: {message['content']}")
-                            elif message["role"] == "context":
-                                context = message["content"]
-                                with st.expander("Click to see the context"):
-                                    for doc, relevance in context:
-                                        st.markdown(f"> **Context Document**: {doc.metadata['source']}")
-                                        st.markdown(f"> **Page Number**: {doc.metadata['page']}")
-                                        st.markdown(f"> **Content**: {doc.page_content}")
-                                        st.markdown(f"> **Relevancy**: {relevance}")
-
+        with st.container():
+            st.markdown('<div class="chat-box">', unsafe_allow_html=True)
+            if st.session_state.is_summary:
+                st.write(st.session_state.summary)
+            else:
+                if user_question:
+                    for message in st.session_state.chat_history:
+                        if message["role"] == "user":
+                            st.markdown(f"> **User**: {message['content']}")
+                        elif message["role"] == "model":
+                            st.markdown(f"> **Model**: {message['content']}")
+                        elif message["role"] == "context":
+                            context = message["content"]
+                            with st.expander("Click to see the context"):
+                                for doc, relevance in context:
+                                    st.markdown(f"> **Context Document**: {doc.metadata['source']}")
+                                    st.markdown(f"> **Page Number**: {doc.metadata['page']}")
+                                    st.markdown(f"> **Content**: {doc.page_content}")
+                                    st.markdown(f"> **Relevancy**: {relevance}")
             st.markdown('</div>', unsafe_allow_html=True)
 
-    # Use st.rerun() to update the display immediately after sending the message
-    #st.rerun()
-
-
-    # CSS for fixed input area
     st.markdown("""
             <style>
                 .reportview-container .main .block-container {
@@ -478,7 +391,6 @@ def main():
                 }
             </style>
         """, unsafe_allow_html=True)
-    
 
 if __name__ == '__main__':
     main()

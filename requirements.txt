@@ -9,3 +9,4 @@ faiss-cpu
 langchain-community
 langchain-core
 langchain_openai
+ragas

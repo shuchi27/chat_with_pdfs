@@ -12,7 +12,10 @@ from langchain.chains import ConversationalRetrievalChain,RetrievalQA
 from htmlTemplates import  css, bot_template, user_template
 from langchain_core.prompts import ChatPromptTemplate,PromptTemplate
 from langchain.chains.summarize import load_summarize_chain
-from langchain.docstore.document import Document
+from ragas import evaluate
+from datasets import Dataset
+from ragas.metrics.critique import harmfulness
+from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall, context_entity_recall, answer_similarity, answer_correctness
 import concurrent.futures
 import openai
 import numpy as np
@@ -25,22 +28,45 @@ import logging
 logging.basicConfig(level=logging.INFO)
 import time
 import tiktoken
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import FlashrankRerank
+
+load_dotenv()
+
+embedding = OpenAIEmbeddings(model="text-embedding-3-large")
+llm = ChatOpenAI(temperature=0)
+
 
 def load_vectorstore(text_chunks=None):
     if os.path.exists("db"):
         # Load the existing vectorstore
-        db = FAISS.load_local("db", OpenAIEmbeddings(), allow_dangerous_deserialization=True)
+        db = FAISS.load_local("db", embedding, allow_dangerous_deserialization=True)
         if text_chunks is not None:
             # Create a temporary vectorstore from the new text chunks
-            new_vectorstore = FAISS.from_documents(documents=text_chunks, embedding=OpenAIEmbeddings())
+            st.session_state.is_vectorstore_update = True
+
+            create_embedding_start_time=time.time()
+            new_vectorstore = FAISS.from_documents(documents=text_chunks, embedding=embedding)
+            create_embedding_end_time=time.time()
+            create_embedding_time = (create_embedding_end_time - create_embedding_start_time) * 1000
+            print(f"Time taken to create embeddings: {create_embedding_time:} ms")
+
+
             # Merge the new vectorstore into the existing one
             db.merge_from(new_vectorstore)
             # Optionally save the updated vectorstore back to disk
             db.save_local("db")
     else:
         if text_chunks is not None:
+            st.session_state.is_vectorstore_update = True
+
             # Create a new vectorstore from the text chunks
-            db = FAISS.from_documents(documents=text_chunks, embedding=OpenAIEmbeddings())
+            create_embedding_start_time=time.time()
+            db = FAISS.from_documents(documents=text_chunks, embedding=embedding)
+            create_embedding_end_time=time.time()
+            create_embedding_time = (create_embedding_end_time - create_embedding_start_time) * 1000
+            print(f"Time taken to create embeddings: {create_embedding_time:} ms")
+
             # Save the new vectorstore to disk
             db.save_local("db")
         else:
@@ -50,12 +76,12 @@ def load_vectorstore(text_chunks=None):
     return db
 
 
-
 class Document:
     def __init__(self, json_string):
         data = json.loads(json_string)
         self.page_content = data.get("page_content", "")
         self.metadata = data.get("metadata", {})
+
     def to_json(self):
         data = {
             "page_content": self.page_content,
@@ -64,123 +90,91 @@ class Document:
         return json.dumps(data)
  
 
-def get_pdf_content(files):
-    #pattern = r'^(\d+\.\d* (?:\b\w+\b\s*){1,5}\w*)'
-    #pattern = r'^\d+(\.\d+)?\s+[A-Z][a-zA-Z\s.]+$'
-    #pattern = r"^\d+(?:\.\d+)* .*(?:\r?\n(?!\d+(?:\.\d+)* ).*)*"
-    #pattern =  r"^\d+(\.)*(?:\.\d+)?\s+(.*)"
-    #pattern = r"^\d+(?:\.\d+)* .*$"
-    pattern =  r"^\d+(?:\.\d+)?\s+(.*)"
-    #pattern =  r"^\d+(?:\.\d+)*\s+.*"
-    #pattern = r"^\d+(?:\.\d+)*\s+[A-Za-z0-9\s]+(?:[^\n])*$"
 
+def get_pdf_content(files):
+    pattern =  r"^\d+(?:\.\d+)?\s+(.*)"
     chunkList = []
     for file in files:
-        page_count = 1
-        source = file.name
-        pdf_reader = PdfReader(file)  # it initialises pdf object which take pages
-        text=0
-        page_count = 0
+        pdf_reader = PdfReader(file)
         documents = []
-        titles = ""
-
+        page_number =0
         for page in pdf_reader.pages:
             text = page.extract_text()  
             matches = re.findall(pattern, text, re.MULTILINE)
-
-           
-            if(len(matches)!=0):
-                titles = matches
-
-            page_content = text
+            titles = matches if len(matches) != 0 else []
+            page_number += 1
+            #keywords = extract_keywords(text)  # Extract keywords using the LLM
 
             metadata = {
-                'source' : source,
-                'page': page_count,
+                'source': file.name,
+                'page': page_number,
                 'heading': titles
+                #'keywords': keywords  # Add extracted keywords to metadata
             }
-           
-
             pdf_data = {
-                "page_content": page_content,
+                "page_content": text,
                 "metadata": metadata
             }
-           
-
-            # Serialize the dictionary to a JSON string
             document = Document(json.dumps(pdf_data))
-            page_count = page_count+1
             documents.append(document)
 
         text_chunks = get_text_chunks(documents)
         chunkList.extend(text_chunks)
-    return chunkList    
+    return chunkList
 
-
-def get_pdf_content_old(file):
-    text = ""
-    for docs in file:
-        pdf_reader = PdfReader(docs)  # it initialises pdf object which take pages
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text
 
 
 def get_text_chunks(pages):
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
-        chunk_overlap=150,
+        chunk_overlap=350,
         length_function=len
     )
     chunks = text_splitter.split_documents(pages)
     return chunks 
 
 
-def model_query(user_question,num_sources,faiss_indices,selected_file,vectorStore,index_type):
+def model_query(user_question,num_sources,faiss_indices,selected_file,vectorStore,index_type,vectors,vector_ids):
     # Gather related context from documents for each query
      # Load from local storage
     #persisted_vectorstore = load_vectorstore()
 
     if selected_file is not None:
         new_db = faiss_indices[selected_file]
+        vectors, vector_ids = extract_vectors_from_db(new_db)
     else:
         new_db = vectorStore
 
-    extract_vectors_from_db(new_db)
+    embedding_start_time = time.time()
+    query_vector = embedding.embed_query(user_question)
+    embedding_end_time = time.time()
+    embedding_time = (embedding_end_time - embedding_start_time) * 1000
+    query_vector = np.array(query_vector).reshape(1, -1)
 
-    vectors,vector_ids  = extract_vectors_from_db(new_db)
+    query_vector = query_vector.reshape(1, -1)  # Ensure the shape is correct
+    dimension = query_vector.shape[1]
+
+    
+
     search_start_time = time.time()
-
-    if index_type=="L2":
-        docs = index_flat_search(user_question, new_db, vectors,vector_ids,top_k=num_sources)
-        search_end_time = time.time()
-
-    if index_type=="ivf":
-        docs = ivf_index_search(user_question, new_db,vectors,vector_ids)
-        search_end_time = time.time()
-
-    if index_type=="ivfpq":
-        docs = ivfpq_index_search(user_question, new_db,vectors,vector_ids)
-        search_end_time = time.time()
-
-    if index_type=="hsnw":
-        docs = hnsw_index_search(user_question, new_db,vectors,vector_ids)
-        search_end_time = time.time()
-
-    if index_type=="similarity_search":
-        docs = new_db.similarity_search_with_relevance_scores(user_question)
-        search_end_time = time.time()
-
-
+    #docs,final_time = index_flat_search(user_question, new_db, vectors,vector_ids,query_vector,top_k=num_sources)
+    #docs,final_time = ivf_index_search(user_question, new_db,vectors,vector_ids,query_vector)
+    #docs,final_time = ivfpq_index_search(user_question, new_db,vectors,vector_ids,query_vector)
+    #docs = hnsw_index_search(user_question, new_db,vectors,vector_ids)
+    docs = new_db.similarity_search_with_relevance_scores(user_question)
+    #docs,final_time = custom_search(user_question, new_db,vectors,vector_ids,query_vector)
+    search_end_time = time.time()
     final_time = (search_end_time - search_start_time)* 1000
-
 
     #for doc in docs:
         #logging.info("-------------")
         #logging.info("Score: %s", doc[1])
 
     retriever = new_db.as_retriever()
-
+    compressor = FlashrankRerank()
+    compression_retriever = ContextualCompressionRetriever(
+        base_compressor=compressor, base_retriever=retriever
+    )
     #rileysPrompt()
     #prompt fot 
     template = """
@@ -208,7 +202,6 @@ def model_query(user_question,num_sources,faiss_indices,selected_file,vectorStor
         template=template,
     )
 
-
     if 'conversation_memory' not in st.session_state:
         st.session_state.conversation_memory = ConversationBufferMemory(
             memory_key="history",
@@ -227,9 +220,10 @@ def model_query(user_question,num_sources,faiss_indices,selected_file,vectorStor
         }
     )
 
-    ai_message = qa.run(user_question)
+    
 
-    return ai_message,docs,final_time
+    ai_message = qa.run(user_question)
+    return ai_message,docs,final_time,embedding_time
    
 
 def getDocNamesFromVectorStore(db):
@@ -253,37 +247,12 @@ def isFilesExist(uploaded_file_name, unique_docs_list):
         unique_docs_list.extend(uploaded_file_name)
         return True
 
-def retrieve_and_display_embeddings(vectorstore):
-    embeddings_list = []
-    for key in vectorstore.index_to_docstore_id:
-        doc_id = vectorstore.index_to_docstore_id[key]
-        embedding = vectorstore.index.reconstruct(key)
-        doc = vectorstore.docstore.search(doc_id)
-        embeddings_list.append({
-            "document_id": doc_id,
-            "page": doc.metadata.get("page", ""),
-            "source": doc.metadata.get("source", ""),
-            "embedding": np.array(embedding)  # Ensure the embedding is a NumPy array
-        })
-
-    # Print or display the embeddings
-    for item in embeddings_list:
-        st.write(f"Document ID: {item['document_id']}")
-        st.write(f"Page: {item['page']}")
-        st.write(f"Source: {item['source']}")
-        st.write("Embedding:")
-        st.write(item['embedding'])
-        st.write(f"Embedding Shape: {item['embedding'].shape}")  # Display the shape of the embedding
-        st.write("\n")
 
 
 def show_vectorstore123(db):
     vector_dataframe = store_to_dataframe(db)
     st.write("Documents in Vector Store")
     st.write(vector_dataframe)
-
-    st.write("Embeddings in Vector Store")
-    retrieve_and_display_embeddings(db)
 
          
 
@@ -304,14 +273,6 @@ def store_to_dataframe(db):
         vector_df = pd.DataFrame(data_rows)
     return vector_df
 
-def delete_document(faiss_index, db,document):
-    st.write("-----------------")
-    vector_dataframe = store_to_dataframe(faiss_index)
-    chunks_list = vector_dataframe.loc[vector_dataframe['document']==document]['chunk_id'].tolist()
-    st.write("&&&&&&&&&&&&&&&&&&&&&&")
-    st.write(chunks_list)
-    db.delete(chunks_list)
-
 
 def get_indices_for_file(db, file_name):
     documentList = []
@@ -325,106 +286,155 @@ def get_indices_for_file(db, file_name):
             #filtered_embeddings.append(db.docstore._dict[key].embedding)
     
     faiss_indices = {
-                        str(file_name): FAISS.from_documents(documentList, OpenAIEmbeddings(disallowed_special=()))
+                        str(file_name): FAISS.from_documents(documentList, embedding(disallowed_special=()))
                     }
     # Create a new FAISS vectorstore from the filtered embeddings
     #new_vectorstore = FAISS.from_embeddings(filtered_embeddings)
     return faiss_indices
 
 
-def index_flat_search(query, db_L2,vectors,vector_ids, top_k=5):
-    embedding = OpenAIEmbeddings()
-    query_vector = embedding.embed_query(query)
-    query_vector = np.array(query_vector).reshape(1, -1)
-
-    # Perform Flat L2 search within the collected vectors
+def index_flat_search(query, db_L2, vectors, vector_ids, query_vector, top_k=5):
+    # Initialize Flat L2 index
     flat_index = faiss.IndexFlatL2(query_vector.shape[1])
-    vectors = [db_L2.index.reconstruct(i) for i in range(db_L2.index.ntotal)]
-    flat_index.add(np.array(vectors))
+    flat_index.add(np.array(vectors))  # Add vectors to the index
 
+    search_start_time = time.time()
+    # Search in the index
     D, I = flat_index.search(query_vector, top_k)
 
     alpha = 0.5
-    relevancy_scores = [np.exp(-alpha * d) for d in D[0]]
-        
-    flat_results = [(db_L2.docstore.search(vector_ids[i]), relevancy_scores[j]) for j, i in enumerate(I[0])]
+    # Combine relevancy score calculation and document retrieval in one loop
+    flat_results = [(db_L2.docstore.search(vector_ids[idx]), np.exp(-alpha * dist)) 
+                    for dist, idx in zip(D[0], I[0])]
+    search_end_time = time.time()
+    search_time = (search_end_time-search_start_time)
 
-    return flat_results
+    return flat_results,search_time
 
-def create_ivf_index(vectors, d, nlist=100):
-    quantizer = faiss.IndexFlatL2(d)  # Flat index for clustering
-    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
-    
-    # Train the IVF index
-    index.train(vectors)
-    index.add(vectors)
 
-    return index
 
-def hybrid_search(query: str, db_ivfpq, top_k: int = 5, cells_to_search: int = 6):
-    embedding = OpenAIEmbeddings()
-    
-    # Step 1: Perform IVFPQ search to get top cells
-    query_vector = embedding.embed_query(query)
-    query_vector = np.array(query_vector)  # Convert to NumPy array
+def custom_search(query: str, db, vectors, vector_ids, query_vector, top_k: int = 5, cells_to_search: int = 10):
+    # Ensure the query vector is correctly shaped
+
+        search_start_time = time.time()
+
+        # Step 3: Perform Flat L2 search within the collected vectors
+        D, I = db.index.search(query_vector, top_k)  # Perform the search
+        # Retrieve results from docstore using IDs
+        alpha = 0.1
+        # Retrieve results from docstore based on indices
+        flat_results = [(db.docstore.search(vector_ids[idx]), np.exp(-alpha * dist)) 
+                    for dist, idx in zip(D[0], I[0])]
+        search_end_time = time.time()
+        search_time = (search_end_time-search_start_time)
+
+            #flat_results = [db_ivfpq.docstore.search(cell_ids[i]) for i in I[0]]
+        return flat_results,search_time
+
+        return []
+
+
+def hybrid_search(query: str, db, vectors, vector_ids, query_vector, top_k: int = 5, cells_to_search: int = 10):
+    # Ensure the query vector is correctly shaped
     query_vector = query_vector.reshape(1, -1)  # Ensure the shape is correct
 
-    distances, indices = db_ivfpq.index.search(query_vector, cells_to_search)
+    # Step 1: Search the db_ivfpq index for the closest cells
+    distances, indices = db.index.search(query_vector, cells_to_search)
+    
 
-    # Step 2: Collect vectors from the top cells
+    # Step 2: Collect vectors and IDs from the top cells
     cell_vectors = []
     cell_ids = []
     for idx in indices[0]:
         if idx != -1:  # valid cell index
-            cell_vectors.append(db_ivfpq.index.reconstruct(int(idx)))  # Ensure idx is an integer
-            cell_ids.append(db_ivfpq.index_to_docstore_id[int(idx)])  # Ensure idx is an integer
+            cell_vectors.append(vectors[int(idx)])  # Retrieve from pre-stored vectors
+            cell_ids.append(vector_ids[int(idx)])  # Retrieve from pre-stored vector IDs
 
     # Step 3: Perform Flat L2 search within the collected vectors
     if cell_vectors:
         dimension = query_vector.shape[1]
         flat_index = faiss.IndexFlatL2(dimension)
-        flat_index.add(np.array(cell_vectors))
-        D, I = flat_index.search(query_vector, top_k)
-        flat_results = [db_ivfpq.docstore.search(cell_ids[i]) for i in I[0]]
+        flat_index.add(np.array(cell_vectors))  # Add collected vectors to the flat index
+        D, I = flat_index.search(query_vector, top_k)  # Perform the search
+        print(I)
+        # Retrieve results from docstore using IDs
+        alpha = 0.5
+        # Retrieve results from docstore based on indices
+        flat_results = [(db.docstore.search(cell_ids[idx]), np.exp(-alpha * dist)) 
+                       for dist, idx in zip(D[0], I[0])]
+
+        #flat_results = [db_ivfpq.docstore.search(cell_ids[i]) for i in I[0]]
         return flat_results
 
     return []
 
-def ivf_index_search(query: str, db_ivf, vectors,vector_ids, nlist=100, top_k=5):
-    embedding = OpenAIEmbeddings()
-    
-    # Step 1: Perform IVFPQ search to get top cells
-    query_vector = embedding.embed_query(query)
-    query_vector = np.array(query_vector).reshape(1, -1)  # Ensure the shape is correct
-
-    if(len(vectors))<nlist:
-        nlist = min(len(vectors), nlist)
-        
+# Example usage:
+# result = hybrid_search("sample query", db_ivfpq, vectors, vector_ids, query_vector)
 
 
+
+
+
+def ivf_index_search(query: str, db_ivf, vectors, vector_ids, query_vector, nlist=50, top_k=5):
     dimension = query_vector.shape[1]
-    # Create and train the IVF index
+    # Create and train the IVF index with a Flat L2 quantizer
     quantizer = faiss.IndexFlatL2(dimension)  # Flat index for clustering
-    ivf_index = faiss.IndexIVFPQ(quantizer, dimension, nlist, 8, 8)  # Using IVFPQ with 8 bits per sub-vector
-
+    ivf_index = faiss.IndexIVFFlat(quantizer, dimension, nlist, faiss.METRIC_L2)  # Using IVFFlat
 
     if vectors:
         ivf_index.train(np.array(vectors))
         ivf_index.add(np.array(vectors))
-        
-        D, I = ivf_index.search(query_vector, top_k)
-        # Calculate relevancy scores from distances
-        alpha = 0.5
-        relevancy_scores = [np.exp(-alpha * d) for d in D[0]]
-        
-        # Retrieve results from docstore based on indices
-        ivf_results = [(db_ivf.docstore.search(vector_ids[i]), relevancy_scores[j]) for j, i in enumerate(I[0])]
-        return ivf_results
 
-    return []   
+        # Perform search
+        #ivf_index.nprobe = max(1, nlist // 10)  # Adjust nprobe for better search accuracy, often nlist/10 is a good start
+        search_start_time = time.time()
+  
+        ivf_index.nprobe = 5
+        D, I = ivf_index.search(query_vector, top_k)
+        
+        alpha = 0.5
+        # Retrieve results from docstore based on indices
+        ivf_results = [(db_ivf.docstore.search(vector_ids[idx]), np.exp(-alpha * dist)) 
+                       for dist, idx in zip(D[0], I[0])]
+        search_end_time = time.time()
+        search_time = (search_end_time-search_start_time)
+        return ivf_results,search_time
+
+    return []
+ 
+
+def ivfpq_index_search(query: str, db_ivfpq,vectors,vector_ids, query_vector,nlist=40, m=16, top_k=5):
+    
+    
+    dimension = query_vector.shape[1]
+    quantizer = faiss.IndexFlatL2(dimension)
+    ivfpq_index = faiss.IndexIVFPQ(quantizer, dimension, nlist, 16, 8)  # 8 bits per sub-vector
+    
+    if vectors:
+        ivfpq_index.train(np.array(vectors))
+        ivfpq_index.add(np.array(vectors))
+
+
+        search_start_time = time.time()
+        #Perform IVFPQ search to get top results
+        ivfpq_index.nprobe = 10  # Adjust nprobe for better search accuracy
+        D, I = ivfpq_index.search(query_vector, top_k)
+
+        alpha = 0.5
+        ivf_results = [(db_ivfpq.docstore.search(vector_ids[idx]), np.exp(-alpha * dist)) 
+                       for dist, idx in zip(D[0], I[0])]
+        search_end_time = time.time()
+        search_time = (search_end_time-search_start_time)
+
+        return ivf_results,search_time
+
+    return []
+
+
 
 def hnsw_index_search(query: str, db_ivf, vectors, vector_ids, top_k=5, ef_search=50, ef_construction=200):
-    embedding = OpenAIEmbeddings()
+    #embedding = OpenAIEmbeddings()
+    #embedding = OpenAIEmbeddings(model_name="text-embedding-3-large")
     
     # Step 1: Convert the query to its vector representation
     query_vector = embedding.embed_query(query)
@@ -459,21 +469,6 @@ def hnsw_index_search(query: str, db_ivf, vectors, vector_ids, top_k=5, ef_searc
     return []
 
 
-def hsnw_index_search(query: str, db_ivf, vectors,vector_ids, nlist=100, top_k=5):
-    d = 128      # Dimension (length) of vectors.
-    M = 32       # Number of connections that would be made for each new vertex during HNSW construction.
-
-    # Creating the index.
-    index = faiss.IndexHNSWFlat(d, M)            
-    index.hnsw.efConstruction = 40         # Setting the value for efConstruction.
-    index.hnsw.efSearch = 16               # Setting the value for efSearch.
-
-    # Adding vectors to the index (xb are database vectors that are to be indexed).
-    index.add(vectors)                  
-
-    # xq are query vectors, for which we need to search in xb to find the k nearest neighbors.
-    # The search returns D, the pairwise distances, and I, the indices of the nearest neighbors.
-    D, I = index.search(xq, k)    
 
 def extract_vectors_from_db(db):
     vectors = []
@@ -485,41 +480,13 @@ def extract_vectors_from_db(db):
     return vectors,ids
         
 
-def ivfpq_index_search(query: str, db_ivfpq,vectors,vector_ids, nlist=100, m=8, top_k=5):
-    
-    embedding = OpenAIEmbeddings()
-    query_vector = embedding.embed_query(query)
-    query_vector = np.array(query_vector).reshape(1, -1)
-
-    dimension = query_vector.shape[1]
-    quantizer = faiss.IndexFlatL2(dimension)
-    ivfpq_index = faiss.IndexIVFPQ(quantizer, dimension, nlist, m, 8)  # 8 bits per sub-vector
-    
-    if vectors:
-        ivfpq_index.train(np.array(vectors))
-        ivfpq_index.add(np.array(vectors))
-
-        #Perform IVFPQ search to get top results
-        ivfpq_index.nprobe = 10  # Adjust nprobe for better search accuracy
-        D, I = ivfpq_index.search(query_vector, top_k)
-
-        alpha = 0.5
-        relevancy_scores = [np.exp(-alpha * d) for d in D[0]]
-
-        # Retrieve results from docstore based on indices
-        ivfpq_results = [(db_ivfpq.docstore.search(vector_ids[i]), relevancy_scores[j]) for j, i in enumerate(I[0])]
-        return ivfpq_results
-
-    return []
-
-
 def main():
-    load_dotenv()
     db = None
     doc_list=[]
     if os.path.exists("db"):
         vector_start_time = time.time()
         db = load_vectorstore()
+        vectors,vector_ids = extract_vectors_from_db(db)
         vector_end_time = time.time()
         vector_load_time = vector_end_time - vector_start_time
         print(f"Time taken to load vector: {vector_load_time} seconds")
@@ -547,18 +514,20 @@ def main():
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
-    
+    if "is_vectorstore_update" not in st.session_state:
+        st.session_state.is_vectorstore_update = False
+
 
     st.set_page_config(st.session_state.title,page_icon=":books:")
     st.write(css, unsafe_allow_html=True)
     vectorStore = None
     faiss_indices  = None
+    
     with st.sidebar:
         st.title("Document Query Settings")        
         uploaded_file_names = []
         files = st.file_uploader("Upload your PDFs here and click on process", accept_multiple_files=True)
         text_chunks = ""
-        append_chunks = ""
         if st.button("Load Data"):
          with st.spinner("Loading Data......"):
             if files:
@@ -575,23 +544,26 @@ def main():
             if isFile:
                 # get content from uploaded PDFs
                 chunkList = get_pdf_content(files)
-
+            
+                    
                 # split the text chunks
                 #text_chunks = get_text_chunks(pages)
 
                     # st.write("creatig vectorstore.....")
                 db = load_vectorstore(chunkList)
+                vectors,vector_ids = extract_vectors_from_db(db)
+
                 # st.write(vectorStore)    
 
         files = ""
         # Add a slider for number of sources to return 1-5
         num_sources = st.slider("Number of sources per document:", min_value=1, max_value=5, value=3)
-
-        index_type = st.selectbox(
-            "Choose faiss index to search:",
-            options=["L2", "ivf", "ivfpq","hsnw","similarity_search"],
-            index=0  # Default to gpt-4o
-        )
+        index_type= ""
+        #index_type = st.selectbox(
+           # "Choose faiss index to search:",
+           # options=["L2", "ivf", "ivfpq","hsnw","similarity_search"],
+           # index=0  # Default to gpt-4o
+       # )
 
         model_version = st.selectbox(
             "Select the GPT model version:",
@@ -624,8 +596,8 @@ def main():
                 faiss_indices = get_indices_for_file(db,selected_file)
                 st.write(selected_file)
 
-            if st.button("delete document"):
-                delete_document(faiss_indices[selected_file],db,selected_file)
+            #if st.button("delete document"):
+                #delete_document(faiss_indices[selected_file],db,selected_file)
                 
             if st.button("Summary"):
                 st.session_state.is_summary = True
@@ -636,13 +608,15 @@ def main():
                     
                     
                     template_string = """
-                    Read the text delimited by three angular brackets. These are the chunks the documents have been split into.
+                    Read the text delimited by three angular brackets. \
+                    These are the chunks the documents have been split into.
                     Step 1: Summarize Each Chunk
-                    Instruction: Please summarize each chunk individually, capturing the main themes and key points. Do not make things up; only summarize what is actually present in the text. No hallucination.
+                    Instruction: Please summarize each chunk individually, capturing the main themes and key points.\
+                                 Do not make things up; only summarize what is actually present in the text.\
+                                 No hallucination.
                     <<<{text}>>>
                     """
                     prompt_template = ChatPromptTemplate.from_template(template_string)
-
 
                       # Function to summarize a single chunk
                     def summarize_chunk(chunk):
@@ -654,22 +628,15 @@ def main():
                             print(f"Error: {e}")
                             time.sleep(5)  # Wait before retrying in case of rate limit
                             return None
-
-                                        
+ 
                     if faiss_indices is not None:
 
                         all_chunks = []
-                        text = ""
                         newdb = faiss_indices[selected_file]
-
                         for key in newdb.docstore._dict.keys():
                             doc = newdb.docstore._dict[key]
                             all_chunks.append(doc)
 
-                        docs = faiss_indices[selected_file].similarity_search_with_relevance_scores(question)
-                      
-                        #st.write(docs)  
-                        #st.write(len(docs))
                        # Summarize chunks in parallel
                         start_time = time.time()
                         with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -680,7 +647,9 @@ def main():
 
                         # Final template for creating a summary from chunk summaries
                         final_template_string = """
-                        Based on the summaries of all the chunks provided below, create a final, concise, and to-the-point summary that captures the main themes and key points from the entire document. Exclude the disclaimer from the summary if any exists in the document.
+                        Based on the summaries of all the chunks provided below, \
+                        create a final, concise, and to-the-point summary that captures the main themes and key points\
+                        from the entire document. Exclude the disclaimer from the summary if any exists in the document.
                         Summaries of chunks:
                         <<<{chunk_summaries}>>>
                         """
@@ -705,14 +674,12 @@ def main():
                     st.write(sorted_doc_list)
 
         
-
             
     # Main section
     st.title(st.session_state.title)
-    #with st.expander("Show VectorStore"):
+   # with st.expander("Show VectorStore"):
             #show_vectorstore(db)
 
-   
 
     # Center container for responses
     chat_container = st.container()
@@ -721,7 +688,6 @@ def main():
 
    
    # Lower section for prompt input
-    
     user_question = st.chat_input("Ask something", key="prompt_input")
     # Send button
 
@@ -730,13 +696,14 @@ def main():
         st.session_state.is_summary= False
         st.session_state.chat_history.append({"role": "user", "content": user_question})
         query_start_time = time.time()
-        model_response, context,final_time = model_query(user_question,num_sources,faiss_indices,selected_file,db,index_type)
+        model_response, context,final_time,embedding_time = model_query(user_question,num_sources,faiss_indices,selected_file,db,index_type,vectors,vector_ids)
         query_end_time = time.time()
-        query_load_time = query_end_time - query_start_time
-        print(f"Time taken to search: {final_time:.2f} ms")
+        query_load_time = (query_end_time - query_start_time)
+        print(f"Time taken to search: {final_time:} ms")
 
-        print(f"Time taken for response: {query_load_time} seconds")
+        print(f"Time taken for response: {query_load_time:} sec")
 
+        print(f"Time taken for embedding: {embedding_time:.2f} ms")
 
         st.session_state.chat_history.append({"role": "model", "content": model_response})
         if context:
