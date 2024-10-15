@@ -1,4 +1,6 @@
 pandas
+bokeh
+pydantic
 numpy
 python-dotenv
 langchain
@@ -11,3 +13,5 @@ langchain-core
 langchain_openai
 ragas
 flashrank
+nltk
+

@@ -1,9 +1,10 @@
 import streamlit as st
 from dotenv import load_dotenv 
 from PyPDF2 import PdfReader
-from langchain_community.chat_models import ChatOpenAI
+#from langchain_community.chat_models import ChatOpenAI
 from langchain_openai import ChatOpenAI
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.vectorstores import VectorStoreRetriever
@@ -14,7 +15,7 @@ from langchain_core.prompts import ChatPromptTemplate,PromptTemplate
 from langchain.chains.summarize import load_summarize_chain
 from ragas import evaluate
 from datasets import Dataset
-from ragas.metrics.critique import harmfulness
+#from ragas.metrics.critique import harmfulness
 from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall, context_entity_recall, answer_similarity, answer_correctness
 import concurrent.futures
 import openai
@@ -154,7 +155,6 @@ def model_query(user_question,num_sources,faiss_indices,selected_file,vectorStor
     query_vector = query_vector.reshape(1, -1)  # Ensure the shape is correct
     dimension = query_vector.shape[1]
 
-    
 
     search_start_time = time.time()
     #docs,final_time = index_flat_search(user_question, new_db, vectors,vector_ids,query_vector,top_k=num_sources)
@@ -209,7 +209,7 @@ def model_query(user_question,num_sources,faiss_indices,selected_file,vectorStor
         )
 
     qa = RetrievalQA.from_chain_type(
-        llm=ChatOpenAI(),
+        llm=llm,
         chain_type='stuff',
         retriever=retriever,
         verbose=True,
@@ -219,8 +219,6 @@ def model_query(user_question,num_sources,faiss_indices,selected_file,vectorStor
             "memory": st.session_state.conversation_memory,
         }
     )
-
-    
 
     ai_message = qa.run(user_question)
     return ai_message,docs,final_time,embedding_time
@@ -236,7 +234,6 @@ def getDocNamesFromVectorStore(db):
         return unique_docs_list
 
 
-        
 def isFilesExist(uploaded_file_name, unique_docs_list):
     existing_files = [file_name for file_name in uploaded_file_name if file_name in unique_docs_list]
     
@@ -246,7 +243,6 @@ def isFilesExist(uploaded_file_name, unique_docs_list):
     else:
         unique_docs_list.extend(uploaded_file_name)
         return True
-
 
 
 def show_vectorstore123(db):
@@ -374,9 +370,6 @@ def hybrid_search(query: str, db, vectors, vector_ids, query_vector, top_k: int 
 # result = hybrid_search("sample query", db_ivfpq, vectors, vector_ids, query_vector)
 
 
-
-
-
 def ivf_index_search(query: str, db_ivf, vectors, vector_ids, query_vector, nlist=50, top_k=5):
     dimension = query_vector.shape[1]
     # Create and train the IVF index with a Flat L2 quantizer
@@ -405,8 +398,7 @@ def ivf_index_search(query: str, db_ivf, vectors, vector_ids, query_vector, nlis
     return []
  
 
-def ivfpq_index_search(query: str, db_ivfpq,vectors,vector_ids, query_vector,nlist=40, m=16, top_k=5):
-    
+def ivfpq_index_search(query: str, db_ivfpq,vectors,vector_ids, query_vector,nlist=40, m=16, top_k=10):
     
     dimension = query_vector.shape[1]
     quantizer = faiss.IndexFlatL2(dimension)
@@ -419,7 +411,7 @@ def ivfpq_index_search(query: str, db_ivfpq,vectors,vector_ids, query_vector,nli
 
         search_start_time = time.time()
         #Perform IVFPQ search to get top results
-        ivfpq_index.nprobe = 10  # Adjust nprobe for better search accuracy
+        ivfpq_index.nprobe = 20  # Adjust nprobe for better search accuracy
         D, I = ivfpq_index.search(query_vector, top_k)
 
         alpha = 0.5
@@ -546,6 +538,7 @@ def main():
             if isFile:
                 # get content from uploaded PDFs
                 chunkList = get_pdf_content(files)
+                st.write(chunkList)
             
                     
                 # split the text chunks
