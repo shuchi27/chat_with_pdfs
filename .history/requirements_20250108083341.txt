@@ -1,12 +1,11 @@
-streamlit
-numpy
 pandas
-scikit-learn
 bokeh
 pydantic
+numpy
 python-dotenv
 langchain
 PyPDF2
+streamlit
 openai
 faiss-cpu
 langchain-community
