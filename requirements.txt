@@ -13,6 +13,9 @@ langchain-community
 langchain-core
 langchain_openai
 ragas
+transformers
+datasets
+huggingface_hub
 flashrank
 nltk
 
