@@ -491,7 +491,7 @@ def main():
             
 
     if 'title' not in st.session_state:
-        st.session_state.title = "ChatGPT with Document Query"  # Default title
+        st.session_state.title = "RAG-Powered Custom ChatGPT"  # Default title
 
     if 'model' not in st.session_state:
         st.session_state.model = None  # Default title
