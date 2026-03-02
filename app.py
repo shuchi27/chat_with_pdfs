@@ -1,17 +1,17 @@
 import streamlit as st
-from dotenv import load_dotenv 
+from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 #from langchain_community.chat_models import ChatOpenAI
-from langchain_openai import ChatOpenAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+#from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.vectorstores import VectorStoreRetriever
 from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain,RetrievalQA
+from langchain.chains import ConversationalRetrievalChain, RetrievalQA
 from htmlTemplates import  css, bot_template, user_template
-from langchain_core.prompts import ChatPromptTemplate,PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain.chains.summarize import load_summarize_chain
 from ragas import evaluate
 from datasets import Dataset
@@ -31,7 +31,6 @@ import time
 import tiktoken
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import FlashrankRerank
-
 load_dotenv()
 
 embedding = OpenAIEmbeddings(model="text-embedding-3-large")
