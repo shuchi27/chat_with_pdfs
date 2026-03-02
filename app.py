@@ -16,6 +16,7 @@ from langchain.chains.summarize import load_summarize_chain
 from ragas import evaluate
 from datasets import Dataset
 #from ragas.metrics.critique import harmfulness
+#from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall, context_entity_recall, answer_correctness,answer_similarity
 from ragas.metrics.collections import faithfulness, answer_relevancy, context_precision, context_recall, context_entity_recall, answer_correctness
 import concurrent.futures
 import openai
